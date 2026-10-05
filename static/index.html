@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>雨水调蓄池推演</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>雨水调蓄池水力推演</h1>
+  <p class="sub">水头 = 底高程 + 水量 / 截面积 ｜ 管流 = 系数·√正水头差 ｜ 泵按启/停水位滞回切换 ｜ 连续时间事件推演</p>
+</header>
+
+<main>
+<section class="panel" id="formPanel">
+  <h2>推演参数</h2>
+
+  <div class="grid4">
+    <label>时段起点
+      <input type="number" step="any" id="t_start" value="0">
+    </label>
+    <label>时段终点
+      <input type="number" step="any" id="t_end" value="6">
+    </label>
+    <label>输出采样点数
+      <input type="number" step="1" min="2" max="10000" id="n_points" value="300">
+    </label>
+    <label class="btncell">
+      <button id="runBtn" class="primary">开始推演</button>
+    </label>
+  </div>
+
+  <div class="section-head">
+    <h3>调蓄池</h3>
+    <button class="mini" data-add="tank">＋ 添加池</button>
+  </div>
+  <div id="tankList"></div>
+
+  <div class="section-head">
+    <h3>重力管道（单向，可成环）</h3>
+    <button class="mini" data-add="pipe">＋ 添加管道</button>
+  </div>
+  <div id="pipeList"></div>
+
+  <div class="section-head">
+    <h3>排外泵</h3>
+    <button class="mini" data-add="pump">＋ 添加泵</button>
+  </div>
+  <div id="pumpList"></div>
+
+  <div class="actions">
+    <button id="resetBtn" class="ghost">恢复示例数据</button>
+  </div>
+
+  <div id="errorBox" class="error hidden"></div>
+</section>
+
+<section id="resultPanel" class="panel hidden">
+  <h2>推演结果</h2>
+
+  <div id="balanceCards" class="cards"></div>
+  <div id="balanceLine"></div>
+
+  <div class="chart-block">
+    <div class="chart-head">
+      <h3>水位过程</h3>
+      <div class="seg" id="levelSeg">
+        <button data-metric="depth" class="on">水深</button>
+        <button data-metric="head">水头(水位高程)</button>
+        <button data-metric="volume">存水量</button>
+      </div>
+    </div>
+    <canvas id="levelChart" height="340"></canvas>
+  </div>
+
+  <div class="chart-block">
+    <div class="chart-head">
+      <h3>累计过水量</h3>
+      <div class="seg" id="cumSeg">
+        <button data-metric="pipe" class="on">重力管道</button>
+        <button data-metric="pump">排外泵</button>
+        <button data-metric="overflow">溢流</button>
+      </div>
+    </div>
+    <canvas id="cumChart" height="300"></canvas>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <h3>泵切换时刻</h3>
+      <div class="table-wrap">
+        <table id="switchTable">
+          <thead><tr><th>时刻</th><th>泵</th><th>所属池</th><th>动作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h3>水量汇总</h3>
+      <div class="table-wrap">
+        <table id="sumTable">
+          <thead><tr><th>对象</th><th>累计过水量</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>FastAPI ＋ SciPy (DOP853 事件推演) ＋ 原生 JavaScript / Canvas</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
