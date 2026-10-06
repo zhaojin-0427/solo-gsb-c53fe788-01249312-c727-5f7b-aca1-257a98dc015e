@@ -11,6 +11,11 @@
   * 满池（V=容量）时，泵仍可排出，净余水量计为溢流；
   * 不允许负水量与反向流；
   * 同一时刻：先更新入流与泵，再结算边界流量。
+
+输出轨迹按分段连续解重建：每个积分段保留 solve_ivp 的稠密解，
+输出时刻（均匀网格 + 泵切换时刻 + 起终点）归入所在积分段取值；
+与断点/切换同刻的采样点取同刻结算（先更新入流与泵、再结算边界）
+后的状态，不做跨段直线插值。
 """
 
 from __future__ import annotations
@@ -404,7 +409,8 @@ def simulate(cfg: dict) -> dict:
                 evs.append(("pump_on", j, gon))
         return evs
 
-    samples = [(t, y.copy())]
+    samples = [(t, y.copy())]      # 断点/事件处的结算后状态（同刻取值用）
+    segments = []                  # 各积分段 (起点, 终点, 稠密解)，拼接覆盖全程
 
     def push(tt, yy):
         if samples and abs(samples[-1][0] - tt) <= eps_t:
@@ -524,6 +530,7 @@ def simulate(cfg: dict) -> dict:
                 ye[i] = 0.0
             for i in ctx.pinned_full:
                 ye[i] = cap[i]
+            segments.append((t, te, sol.sol))
             y, t = ye, te
             push(t, y)
             while bi + 1 < len(breaks) and breaks[bi + 1] <= t + eps_t:
@@ -572,6 +579,7 @@ def simulate(cfg: dict) -> dict:
             ye[i] = 0.0
         for i in ctx.pinned_full:
             ye[i] = cap[i]
+        segments.append((t, te, sol.sol))
         y = ye
         t = te
         push(t, y)
@@ -622,7 +630,9 @@ def simulate(cfg: dict) -> dict:
         log_switch(j, t)
     push(c["t1"], y)
 
-    # ---- 整理轨迹（事件样本 + 均匀输出网格合并后线性插值）----
+    # ---- 整理轨迹（分段连续解采样，不做跨段直线插值）----
+    # st/sy：各断点、事件与端点处“同刻结算后”的状态（先更新入流与泵、
+    # 再结算边界的结果）；segments：覆盖全程的各积分段稠密解。
     st = np.array([s[0] for s in samples])
     sy = np.array([s[1] for s in samples])
     order = np.argsort(st)
@@ -641,8 +651,41 @@ def simulate(cfg: dict) -> dict:
         [np.linspace(c["t0"], c["t1"], c["n_points"]), sw_times,
          [c["t0"], c["t1"]]]))
     Y = np.empty((len(query), ns))
-    for r in range(ns):
-        Y[:, r] = np.interp(query, st, sy[:, r])
+    filled = np.zeros(len(query), bool)
+
+    # 1) 与断点/切换同刻的采样点：沿用同刻结算后的状态
+    pos = np.searchsorted(st, query)
+    for qi in range(len(query)):
+        best, best_d = -1, eps_t
+        for ci in (pos[qi] - 1, pos[qi]):
+            if 0 <= ci < len(st):
+                d = abs(st[ci] - query[qi])
+                if d <= best_d:
+                    best, best_d = ci, d
+        if best >= 0:
+            Y[qi] = sy[best]
+            filled[qi] = True
+
+    # 2) 其余采样点归入所在积分段，用该段稠密解求值（段内连续真解）
+    if segments:
+        seg_start = np.array([s[0] for s in segments])
+        seg_of = np.searchsorted(seg_start, query, side="right") - 1
+        for qi in range(len(query)):
+            if filled[qi]:
+                continue
+            si = seg_of[qi]
+            if si < 0:
+                continue
+            a, b, dense = segments[si]
+            if query[qi] <= b + eps_t:
+                Y[qi] = dense(min(max(query[qi], a), b))
+                filled[qi] = True
+
+    # 3) 兜底（正常不会触发）：未覆盖点退化为结算样本间线性插值
+    if not np.all(filled):
+        for r in range(ns):
+            Y[~filled, r] = np.interp(query[~filled], st, sy[:, r])
+
     Y[:, n:] = np.maximum.accumulate(Y[:, n:], axis=0)   # 累计量单调
     Y[:, :n] = np.clip(Y[:, :n], 0.0, cap)
 

@@ -157,6 +157,94 @@ def test_inflow_breakpoint_continues():
     assert r["tanks"][0]["volume"][-1] == pytest.approx(50.0, rel=1e-6)
 
 
+# ------------------------------------------------- 过程曲线（分段连续解采样）
+
+def test_midsegment_points_follow_continuous_solution():
+    """两池一管、无入流无泵、未触空满、无中途断点：段内采样点必须落在
+    连续积分真解上（sqrt 水头差衰减），而非起终点直线插值。"""
+    cfg = {
+        "t_start": 0, "t_end": 10, "n_points": 11,
+        "tanks": [
+            {"id": "A", "bottom": 0.0, "area": 4.0, "capacity": 1e6,
+             "initial_volume": 400.0},
+            {"id": "B", "bottom": 0.0, "area": 4.0, "capacity": 1e6,
+             "initial_volume": 0.0},
+        ],
+        "pipes": [{"id": "P1", "upstream": "A", "downstream": "B", "coeff": 2.0}],
+        "pumps": [], "inflows": [],
+    }
+    r = simulate(cfg)
+    c, sa, sb = 2.0, 4.0, 4.0
+    d0 = 400.0 / sa                        # 初始水头差
+    k = c * (1 / sa + 1 / sb)              # d(sqrt ΔH)/dt = -k/2
+    t_star = 2 * math.sqrt(d0) / k         # 水头拉平时刻（=20，窗外）
+    v_eq = 400.0 * sa / (sa + sb)          # 拉平后 A 存水
+    ts = np.array(r["times"])
+    va_exact = np.where(
+        ts < t_star,
+        400.0 - c * (math.sqrt(d0) * ts - k * ts ** 2 / 4),
+        v_eq)
+    va_num = np.array(r["tanks"][0]["volume"])
+    cum_num = np.array(r["pipes"][0]["cumulative"])
+    # 直线插值在中点的偏差可达 12.5，连续解采样应贴合到积分精度
+    assert np.max(np.abs(va_num - va_exact)) < 1e-4
+    assert np.max(np.abs(cum_num - (400.0 - va_exact))) < 1e-4
+
+
+def test_segments_around_inflow_breakpoint_follow_continuous_solution():
+    """入流断点把过程分成两段：断点后的采样点必须归入断点后的积分段取
+    连续解。构造：等面积双池，段内入流恰好稳住水头差（该段线性可解），
+    断点后退化为 sqrt 水头差衰减（二次曲线），全程解析可解。"""
+    cfg = {
+        "t_start": 0, "t_end": 10, "n_points": 11,
+        "tanks": [
+            {"id": "A", "bottom": 0.0, "area": 4.0, "capacity": 1e6,
+             "initial_volume": 400.0},
+            {"id": "B", "bottom": 0.0, "area": 4.0, "capacity": 1e6,
+             "initial_volume": 0.0},
+        ],
+        "pipes": [{"id": "P1", "upstream": "A", "downstream": "B", "coeff": 2.0}],
+        "pumps": [],
+        "inflows": [{"tank": "A", "t_start": 0, "t_end": 4, "rate": 40.0}],
+    }
+    r = simulate(cfg)
+    # sa=sb=4、c=2 → k=c(1/sa+1/sb)=1；入流 40 恰好平衡管流使 √ΔH≡10：
+    #   段1 [0,4]：q=20 恒定，V_A = 400 + (40-20)·t（线性），管累计 = 20·t；
+    #   段2 [4,10]：√ΔH = 10-(t-4)/2，
+    #   V_A = 480 - 2·(10(t-4) - (t-4)²/4)，管累计 = 80 + 2·(10(t-4) - (t-4)²/4)。
+    ts = np.array(r["times"])
+    va_exact = np.where(
+        ts <= 4.0,
+        400.0 + 20.0 * ts,
+        480.0 - 2.0 * (10.0 * (ts - 4.0) - (ts - 4.0) ** 2 / 4.0))
+    cum_exact = np.where(
+        ts <= 4.0,
+        20.0 * ts,
+        80.0 + 2.0 * (10.0 * (ts - 4.0) - (ts - 4.0) ** 2 / 4.0))
+    va_num = np.array(r["tanks"][0]["volume"])
+    cum_num = np.array(r["pipes"][0]["cumulative"])
+    # 直线插值在断点后段内中点的偏差约 4.5，连续解采样应贴合到积分精度
+    assert np.max(np.abs(va_num - va_exact)) < 1e-4
+    assert np.max(np.abs(cum_num - cum_exact)) < 1e-4
+    # 断点 t=4 恰为采样点：取同刻结算后的状态（与两段解析解一致）
+    i4 = int(np.argmin(np.abs(ts - 4.0)))
+    assert abs(ts[i4] - 4.0) < 1e-9
+    assert va_num[i4] == pytest.approx(480.0, abs=1e-4)
+
+
+def test_times_grid_composition_unchanged():
+    """输出时刻 = 均匀网格 + 泵切换时刻 + 起终点，单调不减且无重复。"""
+    r = run()
+    ts = np.array(r["times"])
+    assert ts[0] == 0.0 and ts[-1] == 12.0
+    assert np.all(np.diff(ts) > 0)
+    for g in np.linspace(0, 12, 400):
+        assert np.min(np.abs(ts - g)) < 1e-9
+    for s in r["switches"]:
+        if 0.0 < s["time"] < 12.0:
+            assert np.min(np.abs(ts - s["time"])) < 1e-9
+
+
 def test_pump_drains_at_full_tank():
     """满池 + 强入流 + 大泵：泵全程开启排水，溢流只计净余。"""
     cfg = {
