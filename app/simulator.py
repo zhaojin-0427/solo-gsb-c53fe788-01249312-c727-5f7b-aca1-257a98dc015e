@@ -404,13 +404,13 @@ def simulate(cfg: dict) -> dict:
                 evs.append(("pump_on", j, gon))
         return evs
 
-    samples = [(t, y.copy())]
-
-    def push(tt, yy):
-        if samples and abs(samples[-1][0] - tt) <= eps_t:
-            samples[-1] = (tt, yy.copy())
-        else:
-            samples.append((tt, yy.copy()))
+    # 每个事件 / 入流断点界定的积分段都保留其连续解（DOP853 dense output）：
+    # 段内方程 regime 恒定（入流恒定、泵开关固定、空/满钉住集合固定），
+    # 输出网格点直接取所属段的连续解，避免把曲线在段端点间拉成直线。
+    # ta：段起点（上段同刻结算后的状态 ya）；tb：段终点；
+    # yb：段末“先更新入流与泵、再结算边界”之后的状态，供与断点/切换同刻
+    # 的采样点沿用。
+    segments = []
 
     def log_switch(j, tt):
         pu = c["pumps"][j]
@@ -484,7 +484,6 @@ def simulate(cfg: dict) -> dict:
     # 初态一致性（入流断点若在 t0，右连续取新值；泵校验后不应翻转）
     for j in settle(t):
         log_switch(j, t)
-    push(t, y)
 
     # 全部入流断点（已含 t0、t1），单调推进
     breaks_set = {c["t0"], c["t1"]}
@@ -508,46 +507,24 @@ def simulate(cfg: dict) -> dict:
         evs = make_events(t)
         target = c["t1"] if bi + 1 >= len(breaks) else min(c["t1"], breaks[bi + 1])
 
-        # 无事件需要处理：整段直接积分到下一断点
-        if not evs:
-            try:
-                sol = solve_ivp(rhs, (t, target), y, method="DOP853",
-                                dense_output=True, rtol=1e-8, atol=1e-10,
-                                max_step=target - t)
-            except Exception as exc:
-                raise SimulationError(f"连续推演失败: {exc}") from exc
-            if not sol.success:
-                raise SimulationError(f"连续推演失败: {sol.message}")
-            te = float(target)
-            ye = sol.sol(te)
-            for i in ctx.pinned_empty:
-                ye[i] = 0.0
-            for i in ctx.pinned_full:
-                ye[i] = cap[i]
-            y, t = ye, te
-            push(t, y)
-            while bi + 1 < len(breaks) and breaks[bi + 1] <= t + eps_t:
-                bi += 1
-            for j in settle(t):
-                log_switch(j, t)
-            push(t, y)
-            continue
-
-        # 退化区间（target≈t）：先推进断点索引，再做同刻结算后继续
+        # 退化区间（target≈t）：不产生积分段；先推进断点索引，再做同刻
+        # 结算（先更新入流与泵、再结算边界）后继续。
         if target <= t + eps_t:
             while bi + 1 < len(breaks) and breaks[bi + 1] <= t + eps_t:
                 bi += 1
             for j in settle(t):
                 log_switch(j, t)
-            push(t, y)
             if t >= c["t1"] - eps_t:
                 break
             continue
 
+        # 段起点状态快照：同刻结算完成、尚未进入本段连续积分。
+        ta, ya = t, y.copy()
+
         try:
             sol = solve_ivp(rhs, (t, target), y, method="DOP853",
-                            events=[e[2] for e in evs], dense_output=True,
-                            rtol=1e-8, atol=1e-10,
+                            events=[e[2] for e in evs] if evs else None,
+                            dense_output=True, rtol=1e-8, atol=1e-10,
                             max_step=target - t)
         except SimulationError:
             raise
@@ -565,18 +542,18 @@ def simulate(cfg: dict) -> dict:
 
         hit_break = t_ev is None or t_ev >= target - eps_t
         te = target if hit_break else t_ev
-        ye = sol.sol(te)
+        yv = sol.sol(te)
 
         # 钉住体积回正（积分数值漂移）
         for i in ctx.pinned_empty:
-            ye[i] = 0.0
+            yv[i] = 0.0
         for i in ctx.pinned_full:
-            ye[i] = cap[i]
-        y = ye
+            yv[i] = cap[i]
+        y = yv
         t = te
-        push(t, y)
 
-        # 收集与最早时刻同刻发生的全部事件并依次施加
+        # 收集与最早时刻同刻发生的全部事件并依次施加（边界钉住 / 释放、
+        # 泵翻转）。
         if not hit_break:
             kinds = []
             for ei, (kind, idx, _f) in enumerate(evs):
@@ -608,7 +585,11 @@ def simulate(cfg: dict) -> dict:
         # 同刻：先更新入流与泵，再结算边界流量
         for j in settle(t):
             log_switch(j, t)
-        push(t, y)
+
+        segments.append(dict(ta=float(ta), tb=float(te), sol=sol.sol,
+                             pinned_empty=frozenset(ctx.pinned_empty),
+                             pinned_full=frozenset(ctx.pinned_full),
+                             ya=ya, yb=y.copy()))
 
         if t <= c["t0"] + eps_t:
             stall += 1
@@ -617,32 +598,54 @@ def simulate(cfg: dict) -> dict:
         else:
             stall = 0
 
-    # 终点最终结算
+    if not segments:
+        raise SimulationError("连续推演失败：未产生任何积分段")
+
+    # 终点最终结算（通常已稳定；结算结果即末刻输出）
     for j in settle(t):
         log_switch(j, t)
-    push(c["t1"], y)
+    segments[-1]["yb"] = y.copy()
 
-    # ---- 整理轨迹（事件样本 + 均匀输出网格合并后线性插值）----
-    st = np.array([s[0] for s in samples])
-    sy = np.array([s[1] for s in samples])
-    order = np.argsort(st)
-    st, sy = st[order], sy[order]
-    keep = [0]
-    for i in range(1, len(st)):
-        if st[i] - st[keep[-1]] <= eps_t:
-            keep[-1] = i
-        else:
-            keep.append(i)
-    st, sy = st[keep], sy[keep]
-
+    # ---- 整理轨迹：把均匀网格 + 泵切换时刻归入各自所属的连续积分段 ----
+    # 段内（入流恒定、泵开关与钉住集合不变）直接取 DOP853 的连续解；
+    # 采样点恰与断点/切换同刻时，沿用该刻“先更新入流与泵、再结算边界”
+    # 之后的状态（段末 yb），而非积分器在旧 regime 下端点的原始值。
     sw_times = sorted({s["time"] for s in ctx.switch_log
                        if c["t0"] < s["time"] < c["t1"]})
     query = np.unique(np.concatenate(
         [np.linspace(c["t0"], c["t1"], c["n_points"]), sw_times,
          [c["t0"], c["t1"]]]))
+
+    def eval_segment(seg, tq):
+        """取一个积分段在 tq 时刻的状态；端点容差带内用同刻结算后的结果，
+        避免对刚起步的积分段做极小步距外推（事件定位时刻与网格点可能
+        相差 1e-15 量级）。"""
+        if tq <= seg["ta"] + eps_t:
+            yy = seg["ya"].copy()
+        elif abs(tq - seg["tb"]) <= eps_t:
+            yy = seg["yb"].copy()
+        else:
+            try:
+                yy = np.asarray(seg["sol"](float(tq)), dtype=float).copy()
+            except Exception as exc:
+                raise SimulationError(f"连续解取值失败: {exc}") from exc
+            # 钉住池的体积恒在空/满边界（积分数值漂移回正）
+            for i in seg["pinned_empty"]:
+                yy[i] = 0.0
+            for i in seg["pinned_full"]:
+                yy[i] = cap[i]
+        return yy
+
     Y = np.empty((len(query), ns))
-    for r in range(ns):
-        Y[:, r] = np.interp(query, st, sy[:, r])
+    si = 0
+    for r_, tq in enumerate(query):
+        # 严格越过段末才进入下一段；与段末同刻（含事件定位时刻与网格点
+        # 相差 1e-15 量级）的采样点由 eval_segment 的起点容差带接住，
+        # 沿用该刻先更新入流与泵、再结算边界之后的状态。
+        while si + 1 < len(segments) and tq > segments[si]["tb"] + eps_t:
+            si += 1
+        Y[r_] = eval_segment(segments[si], float(tq))
+
     Y[:, n:] = np.maximum.accumulate(Y[:, n:], axis=0)   # 累计量单调
     Y[:, :n] = np.clip(Y[:, :n], 0.0, cap)
 

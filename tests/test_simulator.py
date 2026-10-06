@@ -157,6 +157,106 @@ def test_inflow_breakpoint_continues():
     assert r["tanks"][0]["volume"][-1] == pytest.approx(50.0, rel=1e-6)
 
 
+def test_two_tank_pipe_interior_matches_continuous_solution():
+    """两池不触空满、无断点、仅靠正水头差经管道输水：段内各采样点必须
+    落在连续积分解上（修复前只保留起终点并直线插值，中点明显失真）。
+
+    解析解：等面积 A、coeff=1，q=sqrt(D/A)，D=V_A-V_B，守恒 V_A+V_B=S；
+    D'=-2 sqrt(D/A)，D(t)=(sqrt(D0)-t/sqrt(A))^2，V_A=S/2+D/2。
+    """
+    A, V0A, V0B, T = 10.0, 50.0, 20.0, 10.0
+    cfg = {
+        "t_start": 0, "t_end": T, "n_points": 11,
+        "tanks": [
+            {"id": "A", "bottom": 0, "area": A, "capacity": 1e6,
+             "initial_volume": V0A},
+            {"id": "B", "bottom": 0, "area": A, "capacity": 1e6,
+             "initial_volume": V0B},
+        ],
+        "pipes": [{"id": "P1", "upstream": "A", "downstream": "B", "coeff": 1.0}],
+        "pumps": [], "inflows": [],
+    }
+    r = simulate(cfg)
+    assert r["times"] == [float(x) for x in np.linspace(0, T, 11)]
+    S, D0 = V0A + V0B, V0A - V0B
+    err_v = err_q = 0.0
+    for tt, va, q in zip(r["times"], r["tanks"][0]["volume"],
+                         r["pipes"][0]["cumulative"]):
+        D = (math.sqrt(D0) - tt / math.sqrt(A)) ** 2
+        va_true = S / 2 + D / 2
+        err_v = max(err_v, abs(va - va_true))
+        err_q = max(err_q, abs(q - (V0A - va_true)))
+    assert err_v < 1e-5 and err_q < 1e-5
+    # 直线插值给出的中点误差量级为 3.6，连续解必须远好于它
+    Dm = (math.sqrt(D0) - T / 2 / math.sqrt(A)) ** 2
+    linear_mid = (V0A + (S / 2 + (math.sqrt(D0) - T / math.sqrt(A)) ** 2 / 2)) / 2
+    assert abs(r["tanks"][0]["volume"][5] - linear_mid) > 1.0
+    assert abs(r["balance"]["residual"]) < 1e-7
+
+
+def test_switch_coincident_with_grid_uses_postswitch_state():
+    """泵切换时刻恰与均匀采样点重合：该点沿用同刻先更新泵、再结算边界的
+    结果（泵已开，累计 0），之后各点按新 regime 的连续解取值。
+
+    在 t=2 设一个入流断点（两段同为 10）使同刻结算确定地把泵打开，
+    不依赖求解器在积分端点的事件定位精度。"""
+    cfg = {
+        "t_start": 0, "t_end": 8, "n_points": 9,
+        "tanks": [{"id": "A", "bottom": 0, "area": 10, "capacity": 1000,
+                   "initial_volume": 0}],
+        "pipes": [],
+        "pumps": [{"id": "P", "tank": "A", "flow": 6, "depth_on": 2,
+                   "depth_off": 0.5, "initial_on": False}],
+        "inflows": [{"tank": "A", "t_start": 0, "t_end": 2, "rate": 10},
+                    {"tank": "A", "t_start": 2, "t_end": 8, "rate": 10}],
+    }
+    r = simulate(cfg)
+    assert r["times"] == [float(x) for x in np.linspace(0, 8, 9)]
+    assert len(r["switches"]) == 1
+    assert r["switches"][0]["on"] and abs(r["switches"][0]["time"] - 2.0) < 1e-9
+    i2 = r["times"].index(2.0)
+    assert abs(r["tanks"][0]["volume"][i2] - 20.0) < 1e-6
+    assert abs(r["pumps"][0]["cumulative"][i2]) < 1e-6
+    i3 = r["times"].index(3.0)
+    assert abs(r["tanks"][0]["volume"][i3] - 24.0) < 1e-4
+    assert abs(r["pumps"][0]["cumulative"][i3] - 6.0) < 1e-4
+    assert abs(r["balance"]["residual"]) < 1e-6
+
+
+def test_pinned_segment_interior_not_flattened():
+    """钉在空/满边界的积分段内，采样点同样取连续解：空池限流时水量恒 0、
+    管累计随时间线性；满池溢流时水量恒满、溢流累计逐点增长。"""
+    cfg = {
+        "t_start": 0, "t_end": 5, "n_points": 11,
+        "tanks": [
+            {"id": "A", "bottom": 5, "area": 10, "capacity": 100,
+             "initial_volume": 0},
+            {"id": "B", "bottom": 0, "area": 1000, "capacity": 1e6,
+             "initial_volume": 0},
+        ],
+        "pipes": [{"id": "P1", "upstream": "A", "downstream": "B", "coeff": 5.0}],
+        "pumps": [],
+        "inflows": [{"tank": "A", "t_start": 0, "t_end": 5, "rate": 3.0}],
+    }
+    r = simulate(cfg)
+    assert abs(r["tanks"][0]["volume"][5]) < 1e-7
+    assert abs(r["pipes"][0]["cumulative"][5] - 7.5) < 1e-6
+
+    cfg2 = {
+        "t_start": 0, "t_end": 2, "n_points": 9,
+        "tanks": [{"id": "X", "bottom": 0, "area": 10, "capacity": 50,
+                   "initial_volume": 0}],
+        "pipes": [], "pumps": [],
+        "inflows": [{"tank": "X", "t_start": 0, "t_end": 2, "rate": 100}],
+    }
+    r2 = simulate(cfg2)
+    t = r2["tanks"][0]
+    # t=1.5（满后段内点）：体积恒满，溢流累计 100
+    assert abs(t["volume"][6] - 50) < 1e-6
+    assert abs(t["overflow_series"][6] - 100) < 1e-4
+    assert abs(t["overflow_total"] - 150) < 1e-4
+
+
 def test_pump_drains_at_full_tank():
     """满池 + 强入流 + 大泵：泵全程开启排水，溢流只计净余。"""
     cfg = {
